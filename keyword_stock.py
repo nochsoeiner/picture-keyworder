@@ -116,6 +116,9 @@ _progress: dict = {}
 _prog_lock = threading.Lock()
 _meta_cache: dict = {}       # filename → exiftool metadata
 _meta_loading = False        # True während ExifTool im Hintergrund lädt
+_meta_total   = 0            # Gesamtzahl zu ladender Bilder
+_meta_done    = 0            # Bereits geladene Bilder
+_meta_epoch   = 0            # Zähler: erhöht sich nach jedem abgeschlossenen Ladevorgang
 _jpegs_cache: list = []      # gecachte Dateiliste für aktuellen Ordner
 _thumb_cache: dict = {}      # filename → JPEG bytes
 _geo_cache:  dict = {}       # "lat,lon" → {city, suburb, state}
@@ -146,11 +149,14 @@ def save_progress():
     os.replace(tmp, _prog_file())
 
 def set_dir(path: Path):
-    global _dir, _progress, _meta_cache, _thumb_cache, _jpegs_cache
+    global _dir, _progress, _meta_cache, _thumb_cache, _jpegs_cache, _meta_total, _meta_done, _meta_epoch
     _dir = path
     _meta_cache.clear()
     _thumb_cache.clear()
     _jpegs_cache.clear()
+    _meta_total = 0
+    _meta_done  = 0
+    _meta_epoch = 0
     with _prog_lock:
         _progress = load_progress()
 
@@ -195,26 +201,55 @@ def find_et() -> str:
             return c
     return None
 
-def read_all_meta(et: str) -> dict:
-    """Liest IPTC/GPS-Metadaten für alle JPEGs im Ordner in einem Aufruf."""
+_ET_FLAGS = [
+    "-IPTC:ObjectName", "-IPTC:Keywords",
+    "-XMP:Title", "-XMP:Subject",
+    "-GPSLatitude", "-GPSLongitude", "-GPSAltitude",
+    "-GPSLatitudeRef", "-GPSLongitudeRef",
+    "-EXIF:DateTimeOriginal",
+    "-EXIF:Make", "-EXIF:Model",
+    "-EXIF:LensModel", "-LensModel",
+    "-EXIF:FocalLength", "-EXIF:FocalLengthIn35mmFormat",
+    "-EXIF:FNumber", "-EXIF:ExposureTime", "-EXIF:ISO",
+    "-EXIF:ExposureCompensation",
+    "-EXIF:Flash", "-EXIF:MeteringMode",
+    "-EXIF:ExposureProgram", "-EXIF:WhiteBalance",
+    "-EXIF:Software", "-EXIF:SerialNumber",
+    "-EXIF:ImageWidth", "-EXIF:ImageHeight",
+    "-XMP:Rating",
+    "-IPTC:City", "-IPTC:Sub-location",
+    "-IPTC:Province-State",
+    "-IPTC:Country-Primary-Location-Name",
+    "-IPTC:CopyrightNotice", "-IPTC:Caption-Abstract",
+    "-EXIF:Copyright",
+    "-Composite:Megapixels",
+    "-File:FileSize",
+]
+
+def read_all_meta(et: str, progress_cb=None) -> dict:
+    """Liest IPTC/GPS-Metadaten für alle JPEGs in Batches (500 Bilder je Aufruf)."""
     if not et:
         return {}
     files = [str(p) for p in _jpegs()]
     if not files:
         return {}
-    try:
-        r = subprocess.run(
-            [et, "-json",
-             "-IPTC:ObjectName", "-IPTC:Keywords",
-             "-XMP:Title", "-XMP:Subject",
-             "-GPSLatitude", "-GPSLongitude", "-GPSAltitude",
-             "-GPSLatitudeRef", "-GPSLongitudeRef",
-             "-EXIF:DateTimeOriginal"] + files,
-            capture_output=True, text=True, timeout=120, encoding="utf-8")
-        data = json.loads(r.stdout)
-        return {str(Path(d["SourceFile"]).relative_to(_dir)): d for d in data}
-    except Exception:
-        return {}
+    BATCH = 500
+    result = {}
+    for i in range(0, len(files), BATCH):
+        batch = files[i:i + BATCH]
+        try:
+            r = subprocess.run(
+                [et, "-json"] + _ET_FLAGS + batch,
+                capture_output=True, text=True, timeout=120, encoding="utf-8")
+            data = json.loads(r.stdout)
+            for d in data:
+                key = str(Path(d["SourceFile"]).relative_to(_dir))
+                result[key] = d
+        except Exception:
+            pass  # Batch überspringen, nächsten versuchen
+        if progress_cb:
+            progress_cb(min(i + BATCH, len(files)), len(files))
+    return result
 
 def _parse_coord(val, ref="") -> float:
     """GPS-Koordinate in Dezimalgrad umwandeln."""
@@ -455,7 +490,7 @@ class Handler(BaseHTTPRequestHandler):
         elif p.startswith("/preview/"):
             self._preview(unquote(p[9:]))
         elif p == "/api/images":      self._api_images()
-        elif p == "/api/meta-status": self._json({"loading": _meta_loading, "cached": len(_meta_cache)})
+        elif p == "/api/meta-status": self._json({"loading": _meta_loading, "cached": len(_meta_cache), "total": _meta_total, "done": _meta_done, "epoch": _meta_epoch})
         elif p == "/api/status":    self._json(_analysis_status())
         elif p == "/api/stats":     self._api_stats()
         else: self._send(404,"text/plain",b"Not found")
@@ -478,18 +513,26 @@ class Handler(BaseHTTPRequestHandler):
     # ── Endpoints ────────────────────────────────────────────────────────────
 
     def _api_images(self):
-        global _meta_loading
+        global _meta_loading, _meta_total, _meta_done
         et = find_et()
         # Metadaten im Hintergrund laden falls noch nicht vorhanden
         if not _meta_cache and not _meta_loading:
             _meta_loading = True
+            _meta_total = len(_jpegs())
+            _meta_done  = 0
             def _bg_load():
-                global _meta_loading
+                global _meta_loading, _meta_done, _meta_total, _meta_epoch
+                def _progress(done, total):
+                    global _meta_done, _meta_total
+                    _meta_done  = done
+                    _meta_total = total
                 try:
-                    _meta_cache.update(read_all_meta(et))
+                    _meta_cache.update(read_all_meta(et, progress_cb=_progress))
+                    _meta_epoch += 1   # signalisiert: neue Metadaten verfügbar
                 finally:
                     _meta_loading = False
             threading.Thread(target=_bg_load, daemon=True).start()
+        meta_snapshot = len(_meta_cache)   # Cache-Größe VOR dem Loop merken
         result = []
         for p in _jpegs():
             n = _relpath(p)             # "subfolder/image.jpg" oder "image.jpg"
@@ -519,8 +562,34 @@ class Handler(BaseHTTPRequestHandler):
                 "cost":      prog.get("cost",0.0),
                 "error_msg": prog.get("error_msg",""),
                 "timestamp": prog.get("timestamp",""),
+                "camera":    (lambda mk,mo: (mo if mo.startswith(mk) else (mk+' '+mo).strip()) if mk and mo else (mk or mo))(str(m.get("Make","")).strip(), str(m.get("Model","")).strip()),
+                "lens":      str(m.get("LensModel","")).strip(),
+                "focal":     str(m.get("FocalLength","")).strip(),
+                "focal35":   str(m.get("FocalLengthIn35mmFormat","")).strip(),
+                "aperture":  str(m.get("FNumber","")).strip(),
+                "shutter":   str(m.get("ExposureTime","")).strip(),
+                "iso":       str(m.get("ISO","")).strip(),
+                "ev":        str(m.get("ExposureCompensation","")).strip(),
+                "flash":     str(m.get("Flash","")).strip(),
+                "metering":  str(m.get("MeteringMode","")).strip(),
+                "program":   str(m.get("ExposureProgram","")).strip(),
+                "wb":        str(m.get("WhiteBalance","")).strip(),
+                "software":  str(m.get("Software","")).strip(),
+                "serial":    str(m.get("SerialNumber","")).strip(),
+                "rating":    int(m.get("Rating") or 0),
+                "city":      str(m.get("City","")).strip(),
+                "subloc":    str(m.get("Sub-location","")).strip(),
+                "state":     str(m.get("Province-State","")).strip(),
+                "country":   str(m.get("Country-Primary-Location-Name",
+                                        m.get("Country-PrimaryLocationName",""))).strip(),
+                "copyright": str(m.get("CopyrightNotice", m.get("Copyright",""))).strip(),
+                "caption":   str(m.get("Caption-Abstract","")).strip(),
+                "megapixels":str(m.get("Megapixels","")).strip(),
+                "width":     m.get("ImageWidth",""),
+                "height":    m.get("ImageHeight",""),
+                "filesize":  str(m.get("FileSize","")).strip(),
             })
-        self._json(result)
+        self._json(result, extra_headers={"X-Meta-Cached": str(meta_snapshot)})
 
     def _thumb(self, filename):
         path = _dir / filename          # relativer Pfad inkl. Unterordner
@@ -592,9 +661,10 @@ class Handler(BaseHTTPRequestHandler):
         err = write_meta(path, title, kws, et)
         if err:
             self._json({"error":err},500); return
+        status = "unbearbeitet" if not title and not kws else "done"
         with _prog_lock:
             if fname not in _progress: _progress[fname] = {}
-            _progress[fname].update({"status":"done","title":title,
+            _progress[fname].update({"status":status,"title":title,
                                      "keywords":kws,"timestamp":_now()})
             save_progress()
         # Metadaten-Cache für dieses Bild invalidieren
@@ -707,19 +777,23 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── HTTP-Hilfsmethoden ───────────────────────────────────────────────────
 
-    def _send(self, code, ct, body):
+    def _send(self, code, ct, body, extra_headers=None):
         try:
             self.send_response(code)
             self.send_header("Content-Type", ct)
             self.send_header("Content-Length", len(body))
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass  # Browser hat Verbindung geschlossen – harmlos
 
-    def _json(self, data, code=200):
+    def _json(self, data, code=200, extra_headers=None):
         self._send(code,"application/json",
-                   json.dumps(data,ensure_ascii=False).encode())
+                   json.dumps(data,ensure_ascii=False).encode(),
+                   extra_headers=extra_headers)
 
     def _html(self, html: str):
         self._send(200,"text/html; charset=utf-8", html.encode("utf-8"))
@@ -788,14 +862,18 @@ main{{flex:1;overflow:hidden;display:flex;flex-direction:column}}
 .tab-content.active{{display:flex;flex-direction:column;gap:12px}}
 
 /* ── Toolbar ── */
+.sticky-header{{position:sticky;top:0;z-index:50;background:var(--bg)}}
 .toolbar{{display:flex;gap:6px;align-items:center;flex-wrap:wrap;flex-shrink:0;
-          position:sticky;top:0;z-index:50;
-          background:var(--bg);padding:10px 0 10px;
+          padding:10px 0 10px;
           border-bottom:1px solid var(--border);margin-bottom:4px}}
 .toolbar-group{{display:flex;gap:4px;align-items:center}}
 .toolbar-label{{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;
                 letter-spacing:.6px;padding:0 4px;white-space:nowrap}}
 .toolbar-sep{{width:1px;height:20px;background:var(--border);margin:0 4px}}
+.toolbar-section{{display:flex;align-items:center;gap:4px;
+                  padding:4px 8px;border-radius:7px}}
+.toolbar-section.section-filter{{background:rgba(255,255,255,.04);border:1px solid #2a2a2a}}
+.toolbar-section.section-select{{background:rgba(25,100,180,.08);border:1px solid rgba(25,100,180,.25)}}
 .filter-btn{{background:var(--surface2);border:1px solid var(--border);color:var(--muted);
              padding:4px 11px;border-radius:4px;cursor:pointer;font-size:12px;white-space:nowrap}}
 .filter-btn:hover{{color:var(--text);border-color:#555}}
@@ -811,45 +889,69 @@ main{{flex:1;overflow:hidden;display:flex;flex-direction:column}}
 .select-count{{font-size:12px;color:var(--muted)}}
 
 /* ── Galerie ── */
-.gallery-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(700px,1fr));gap:14px}}
+.gallery-grid{{display:grid;grid-template-columns:1fr;gap:14px}}
 .card{{background:var(--surface2);border:1px solid var(--border);border-radius:10px;
-       display:flex;overflow:hidden;transition:border-color .2s}}
+       display:grid;grid-template-columns:1fr 1fr 220px;overflow:hidden;
+       transition:border-color .2s;align-items:stretch}}
 .card[data-status="done"]{{border-color:#2e7d32;background:rgba(0,80,0,0.4)}}
 .card[data-status="pending"]{{border-color:#1565c0}}
 .card[data-status="error"]{{border-color:var(--red)}}
 .card.hidden{{display:none!important}}
 
-.card-left{{width:170px;min-width:170px;background:#141414;display:flex;
-            flex-direction:column;align-items:center;padding:10px;gap:8px}}
-.card-left img{{width:150px;height:150px;object-fit:cover;border-radius:6px}}
-.card-filename{{font-size:10px;color:var(--muted);text-align:center;word-break:break-all}}
-.card-date{{font-size:10px;color:#666}}
+/* Spalte 1: Bild */
+.card-left{{background:#0d0d0d;display:flex;flex-direction:column;
+            border-right:1px solid var(--border);position:relative}}
+.card-img-wrap{{display:block;overflow:hidden}}
+.card-img-wrap img{{width:100%;height:auto;display:block;cursor:zoom-in;
+                    object-fit:unset}}
+.card-left-footer{{display:flex;align-items:center;justify-content:space-between;
+                   padding:4px 8px;gap:6px;flex-shrink:0;background:#111}}
+.card-filename{{font-size:10px;color:var(--muted);text-align:center;word-break:break-all;
+               width:100%;padding:0 4px}}
+.card-select{{display:flex;align-items:center;gap:4px;font-size:10px;font-weight:600;
+              color:#90caf9;cursor:pointer;background:#1a237e;border:1px solid #283593;
+              padding:2px 7px;border-radius:10px;white-space:nowrap;transition:background .15s}}
+.card-select:hover{{background:#283593}}
+.card-select input{{cursor:pointer;accent-color:#64b5f6;margin:0}}
 .badge{{font-size:10px;padding:2px 9px;border-radius:10px;font-weight:600;text-align:center}}
 .badge-done{{background:#1b5e20;color:#a5d6a7}}
 .badge-pending{{background:#0d47a1;color:#90caf9}}
 .badge-unbearbeitet{{background:#333;color:#aaa}}
 .badge-error{{background:#b71c1c;color:#ef9a9a}}
-.gps-link{{font-size:10px;color:#64b5f6;text-decoration:none;text-align:center;
-           word-break:break-word}}
-.gps-link:hover{{text-decoration:underline}}
-.card-select{{display:flex;align-items:center;gap:4px;font-size:11px;
-              color:var(--muted);cursor:pointer;margin-top:auto}}
-.card-select input{{cursor:pointer;accent-color:var(--accent)}}
 
-.card-right{{flex:1;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0}}
+/* Spalte 3: Metadaten */
+.card-meta{{padding:14px;display:flex;flex-direction:column;gap:7px;
+            border-left:1px solid var(--border);font-size:12px}}
+.card-meta.hidden{{display:none}}
+.card.meta-hidden{{grid-template-columns:1fr 1fr}}
+.meta-row{{display:flex;flex-direction:column;gap:2px}}
+.meta-label{{font-size:10px;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:.5px}}
+.meta-val{{color:#9e9e9e;word-break:break-word;line-height:1.5}}
+.meta-val.highlight{{color:#ddd}}
+.meta-divider{{border:none;border-top:1px solid #2a2a2a;margin:4px 0}}
+.gps-link{{font-size:11px;color:#64b5f6;text-decoration:none;word-break:break-word}}
+.gps-link:hover{{text-decoration:underline}}
+.meta-exkw{{display:flex;flex-wrap:wrap;gap:3px;margin-top:2px}}
+.meta-exkw span{{background:#1e1e1e;border:1px solid #333;color:#666;
+                 padding:1px 5px;border-radius:3px;font-size:10px}}
+
+/* Spalte 3: Titel + Keywords */
+.card-right{{padding:14px;display:flex;flex-direction:column;gap:8px;min-width:0}}
 .field-label{{font-size:10px;font-weight:700;color:var(--muted);
               text-transform:uppercase;letter-spacing:.6px}}
 .title-input{{background:#1a1a1a;border:1px solid var(--border);color:var(--text);
-              padding:6px 9px;border-radius:5px;font-size:13px;width:100%}}
-.title-input:focus{{outline:none;border-color:#555}}
+              padding:6px 9px;border-radius:4px;font-size:13px;width:100%}}
+.title-input:focus{{outline:none;border-color:#4fc3f7}}
+.title-counter{{font-size:10px}}
 .kw-header{{display:flex;align-items:center;justify-content:space-between}}
-.kw-counter{{font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px}}
+.kw-counter{{font-size:11px;font-weight:700;padding:2px 7px;border-radius:10px}}
 .kw-ok{{background:#1b5e20;color:#a5d6a7}}
 .kw-warn{{background:var(--orange);color:#ffcc80}}
-.tags{{background:#1a1a1a;border:1px solid var(--border);border-radius:5px;
-       padding:6px;display:flex;flex-wrap:wrap;gap:4px;min-height:32px}}
-.tag{{background:var(--tag-bg);color:#b0bec5;padding:3px 6px 3px 8px;border-radius:4px;
-      font-size:12px;display:flex;align-items:center;gap:3px;transition:opacity .15s}}
+.tags{{background:#1a1a1a;border:1px solid var(--border);border-radius:4px;
+       padding:6px;display:flex;flex-wrap:wrap;gap:4px;min-height:32px;
+       max-height:120px;overflow-y:auto}}
+.tag{{background:var(--tag-bg);color:#b0bec5;padding:3px 6px 3px 8px;border-radius:3px;
+      font-size:11px;display:flex;align-items:center;gap:3px;transition:opacity .15s}}
 .tag[draggable]{{cursor:grab}}
 .tag[draggable]:active{{cursor:grabbing}}
 .tag.dragging{{opacity:.35;cursor:grabbing}}
@@ -860,19 +962,45 @@ main{{flex:1;overflow:hidden;display:flex;flex-direction:column}}
 .tag-x:hover{{color:#ef9a9a}}
 .add-row{{display:flex;gap:6px}}
 .kw-input{{flex:1;background:#1a1a1a;border:1px solid var(--border);color:var(--text);
-           padding:5px 8px;border-radius:5px;font-size:12px}}
-.kw-input:focus{{outline:none;border-color:#555}}
+           padding:5px 8px;border-radius:4px;font-size:12px}}
+.kw-input:focus{{outline:none;border-color:#4fc3f7}}
 .kw-input::placeholder{{color:#555}}
 .btn-add{{background:var(--accent);color:#fff;border:none;padding:5px 10px;
-          border-radius:5px;cursor:pointer;font-size:14px}}
+          border-radius:4px;cursor:pointer;font-size:14px;tabindex:-1}}
 .btn-add:hover{{background:#1565c0}}
-.card-footer{{display:flex;align-items:center;gap:8px;margin-top:auto}}
-.btn-save{{background:var(--green);color:#fff;border:none;padding:6px 14px;
-           border-radius:5px;cursor:pointer;font-size:12px;font-weight:600}}
+.card-footer{{display:flex;align-items:center;gap:6px;margin-top:auto;padding-top:6px}}
+.btn-save{{background:var(--green);color:#fff;border:none;padding:7px 10px;
+           border-radius:4px;cursor:pointer;font-size:12px;font-weight:600;width:100%}}
 .btn-save:hover{{background:#388e3c}}
-.error-msg{{font-size:11px;color:#ef9a9a;background:rgba(198,40,40,.12);
-            border:1px solid var(--red);border-radius:4px;padding:4px 8px}}
+.error-msg{{font-size:12px;color:#ef9a9a;background:rgba(198,40,40,.12);
+            border:1px solid var(--red);border-radius:4px;padding:5px 9px}}
 
+/* ── Datumsfilter ── */
+.date-filter-bar{{display:none;align-items:center;gap:8px;padding:5px 14px;
+                  background:#1a1a1a;border-bottom:1px solid var(--border);flex-wrap:wrap}}
+.date-filter-bar.open{{display:flex}}
+.df-select{{background:#111;border:1px solid var(--border);color:var(--text);
+            padding:4px 8px;border-radius:5px;font-size:12px;cursor:pointer;
+            color-scheme:dark}}
+.df-select:focus{{outline:none;border-color:#555}}
+.df-select:disabled{{opacity:.35;cursor:default}}
+.df-active{{border-color:#4fc3f7!important}}
+.df-clear{{background:none;border:1px solid #444;color:#888;padding:4px 10px;
+           border-radius:5px;font-size:12px;cursor:pointer}}
+.df-clear:hover{{color:#fff;border-color:#666}}
+.df-count{{font-size:11px;color:var(--muted)}}
+.btn-filter-toggle{{background:var(--surface2);border:1px solid var(--border);color:var(--muted);
+                    padding:5px 10px;border-radius:5px;cursor:pointer;font-size:12px}}
+.btn-filter-toggle:hover{{color:var(--text);border-color:#555}}
+.btn-filter-toggle.active{{border-color:#4fc3f7;color:#4fc3f7}}
+.rating-bar{{display:none;align-items:center;gap:6px;padding:5px 14px;
+             background:#1a1a1a;border-bottom:1px solid var(--border)}}
+.rating-bar.open{{display:flex}}
+.rating-btn{{background:none;border:1px solid #333;color:#888;padding:3px 10px;
+             border-radius:5px;font-size:13px;cursor:pointer;white-space:nowrap}}
+.rating-btn:hover{{border-color:#666;color:#ffd700}}
+.rating-btn.active{{border-color:#ffd700;color:#ffd700;background:#1a1500}}
+.meta-rating{{color:#ffd700;font-size:13px;letter-spacing:1px}}
 /* ── KI-Analyse ── */
 .analyse-layout{{display:grid;grid-template-columns:320px 1fr;gap:16px;flex:1}}
 .analyse-config{{background:var(--surface2);border:1px solid var(--border);
@@ -1006,9 +1134,10 @@ select:focus, .key-input:focus{{outline:none;border-color:#555}}
 .rv-hclose{{background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;line-height:1;padding:0 6px;border-radius:4px}}
 .rv-hclose:hover{{color:var(--text);background:var(--surface)}}
 .rv-body{{display:flex;flex:1;min-height:0}}
-.rv-imgwrap{{flex:0 0 58%;background:#0c0c0c;display:flex;align-items:center;justify-content:center;overflow:hidden}}
+.rv-imgwrap{{flex:1;background:#0c0c0c;display:flex;align-items:center;justify-content:center;overflow:hidden}}
 .rv-imgwrap img{{max-width:100%;max-height:100%;object-fit:contain;display:block}}
-.rv-fields{{flex:1;padding:14px;display:flex;flex-direction:column;gap:10px;overflow-y:auto}}
+.rv-fields{{flex:0 0 340px;padding:14px;display:flex;flex-direction:column;gap:10px;overflow-y:auto;border-left:1px solid var(--border)}}
+.rv-fields.hidden{{display:none}}
 .rv-footer{{display:flex;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid var(--border);flex-shrink:0}}
 .btn-rnav{{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:7px 14px;border-radius:6px;font-size:13px;cursor:pointer}}
 .btn-rnav:hover{{background:#2a2a2a}}
@@ -1030,35 +1159,59 @@ select:focus, .key-input:focus{{outline:none;border-color:#555}}
 
 <nav>
   <button class="tab active" onclick="showTab('gallery')">Galerie</button>
-  <button class="tab" onclick="showTab('analysis')">KI-Analyse</button>
+  <button class="tab" onclick="showTab('analysis')">KI-Keywords</button>
   <button class="tab" onclick="showTab('stats')">Auswertung</button>
 </nav>
 
 <main>
   <!-- Galerie -->
   <div id="tab-gallery" class="tab-content active">
+    <div class="sticky-header">
     <div class="toolbar">
-      <span class="toolbar-label">Anzeigen</span>
-      <div class="toolbar-group">
-        <button class="filter-btn active" onclick="setFilter('all',this)" title="Alle Bilder anzeigen">&#x22EF; Alle</button>
-        <button class="filter-btn" onclick="setFilter('unbearbeitet',this)" title="Noch nicht analysierte Bilder">&#x25CB; Neu</button>
-<button class="filter-btn" onclick="setFilter('done',this)" title="Keywords gespeichert und in Datei geschrieben">&#x2713; Bearbeitet</button>
-        <button class="filter-btn" onclick="setFilter('error',this)" title="Analyse fehlgeschlagen">&#x26A0; Fehler</button>
+      <div class="toolbar-section section-filter">
+        <span class="toolbar-label">Anzeigen</span>
+        <div class="toolbar-group">
+          <button class="filter-btn active" onclick="setFilter('all',this)" title="Alle Bilder anzeigen">Alle Bilder</button>
+          <button class="filter-btn" onclick="setFilter('ohne',this)" title="Bilder ohne gespeicherte Keywords">Ohne Keywords</button>
+          <button class="filter-btn" onclick="setFilter('mit',this)" title="Bilder mit gespeicherten Keywords">Mit Keywords</button>
+        </div>
       </div>
-      <div class="toolbar-sep"></div>
-      <span class="toolbar-label">Auswahl</span>
-      <div class="toolbar-group">
-        <button class="btn-sm" onclick="selectAll()" title="Alle Bilder für KI-Analyse auswählen">&#x2611; Alle</button>
-        <button class="btn-sm" onclick="selectNone()" title="Auswahl aufheben">&#x2610; Keine</button>
-        <button class="btn-sm" onclick="select100()" title="Genau 100 sichtbare Bilder auswählen (von oben)">&#x2611; 100</button>
-        <button class="btn-sm" onclick="selectUnprocessed()" title="Nur neue (noch nicht analysierte) Bilder auswählen">&#x25CB; Nur Neue</button>
-        <button class="btn-sm" style="color:#ef9a9a" onclick="resetErrors()" title="Fehlgeschlagene Bilder zurücksetzen und erneut analysierbar machen">&#x21BA; Fehler reset</button>
+      <div class="toolbar-section section-select">
+        <span class="toolbar-label">Auswahl</span>
+        <div class="toolbar-group">
+          <button class="btn-sm" onclick="selectAll()" title="Alle Bilder für KI-Analyse auswählen">&#x2611; Alle</button>
+          <button class="btn-sm" onclick="selectNone()" title="Auswahl aufheben">&#x2610; Keine</button>
+          <button class="btn-sm" onclick="select100()" title="Genau 100 sichtbare Bilder auswählen (von oben)">&#x2611; 100</button>
+          <button class="btn-sm" onclick="selectUnprocessed()" title="Nur neue (noch nicht analysierte) Bilder auswählen">&#x25CB; Nur Neue</button>
+          <button class="btn-sm" style="color:#ef9a9a" onclick="resetErrors()" title="Fehlgeschlagene Bilder zurücksetzen und erneut analysierbar machen">&#x21BA; Fehler reset</button>
+        </div>
       </div>
       <div class="toolbar-spacer"></div>
+      <button class="btn-filter-toggle" id="btn-meta-toggle" onclick="toggleMetaCols()" title="Metadaten-Spalte ein-/ausblenden">&#x1F4CB; Metadaten</button>
+      <button class="btn-filter-toggle" id="btn-rating-toggle" onclick="toggleRatingFilter()" title="Nach Lightroom-Bewertung filtern">&#x2B50; Rating</button>
+      <button class="btn-filter-toggle" id="btn-date-toggle" onclick="toggleDateFilter()" title="Datumsfilter ein-/ausblenden">&#x1F4C5; Datum</button>
       <span class="select-count" id="sel-count">0 ausgew&#xE4;hlt</span>
-      <button class="btn-review" id="btn-review-gallery" onclick="openReview()" title="KI-Vorschl&#xE4;ge Bild f&#xFC;r Bild pr&#xFC;fen und speichern">&#x1F50D; Review</button>
-      <button class="btn-primary" onclick="goAnalysis()" title="Ausgew&#xE4;hlte Bilder mit KI analysieren und Keywords generieren">&#x2728; KI-Analyse starten &#x203A;</button>
+      <button class="btn-review" id="btn-review-gallery" onclick="openReview()" title="KI-Vorschl&#xE4;ge Bild f&#xFC;r Bild pr&#xFC;fen und speichern">&#x2713; Vorschl&#xE4;ge pr&#xFC;fen</button>
+      <button class="btn-primary" onclick="goAnalysis()" title="Ausgew&#xE4;hlte Bilder mit KI analysieren und Keywords generieren">&#x2728; Keywords generieren &#x203A;</button>
     </div>
+    <div class="rating-bar" id="rating-bar">
+      <span class="toolbar-label">Min. Rating</span>
+      <button class="rating-btn active" onclick="setRatingFilter(0,this)">Alle</button>
+      <button class="rating-btn" onclick="setRatingFilter(1,this)">&#x2605;1+</button>
+      <button class="rating-btn" onclick="setRatingFilter(2,this)">&#x2605;&#x2605;2+</button>
+      <button class="rating-btn" onclick="setRatingFilter(3,this)">&#x2605;&#x2605;&#x2605;3+</button>
+      <button class="rating-btn" onclick="setRatingFilter(4,this)">&#x2605;&#x2605;&#x2605;&#x2605;4+</button>
+      <button class="rating-btn" onclick="setRatingFilter(5,this)">&#x2605;&#x2605;&#x2605;&#x2605;&#x2605;5</button>
+    </div>
+    <div class="date-filter-bar" id="date-filter-bar">
+      <span class="toolbar-label">Datum</span>
+      <select class="df-select" id="df-year" onchange="dfYearChange()"><option value="">Alle Jahre</option></select>
+      <select class="df-select" id="df-month" onchange="dfMonthChange()"><option value="">Alle Monate</option></select>
+      <select class="df-select" id="df-day" onchange="applyAllFilters()"><option value="">Alle Tage</option></select>
+      <button class="df-clear" id="df-clear-btn" onclick="clearDateFilter()" style="display:none">&#x2715; Zur&#xFC;cksetzen</button>
+      <span class="df-count" id="df-count"></span>
+    </div>
+    </div><!-- /sticky-header -->
     <div class="gallery-grid" id="gallery-grid">
       <div class="empty-state" id="gallery-empty">Bilder werden geladen…</div>
     </div>
@@ -1068,7 +1221,7 @@ select:focus, .key-input:focus{{outline:none;border-color:#555}}
   <div id="tab-analysis" class="tab-content">
     <div class="analyse-layout">
       <div class="analyse-config">
-        <h2>KI-Analyse</h2>
+        <h2>KI-Keywords</h2>
         <div class="form-row">
           <div class="form-label">Ausgewählte Bilder</div>
           <div class="sel-count">
@@ -1093,7 +1246,7 @@ select:focus, .key-input:focus{{outline:none;border-color:#555}}
           </div>
         </div>
         <button class="btn-start" id="btn-start" onclick="startAnalysis()">
-          ▶ Analyse starten
+          ▶ Keywords generieren
         </button>
         <button class="btn-stop" id="btn-stop" onclick="stopAnalysis()">
           ■ Stoppen
@@ -1190,25 +1343,55 @@ async function loadImages() {{
   sbSet('Lade Bilder…', true);
   try {{
     const res = await fetch('/api/images');
+    const metaCachedAtFetch = parseInt(res.headers.get('X-Meta-Cached') || '0');
     allImages = await res.json();
-    renderGallery();
-    updateHeaderStats();
-    _rvUpdateButtons();
-    document.getElementById('gallery-empty').style.display = 'none';
+    if (metaCachedAtFetch > 0) {{
+      renderGallery();
+      updateHeaderStats();
+      _rvUpdateButtons();
+      document.getElementById('gallery-empty').style.display = 'none';
+    }}
     // Prüfen ob ExifTool-Metadaten noch geladen werden
-    const ms = await fetch('/api/meta-status').then(r => r.json()).catch(() => ({{}}));
-    if (ms.loading) {{
-      sbSet('Metadaten werden geladen… (' + allImages.length + ' Bilder)', true);
-      if (_metaPollTimer) clearInterval(_metaPollTimer);
-      _metaPollTimer = setInterval(async () => {{
-        const s = await fetch('/api/meta-status').then(r => r.json()).catch(() => ({{loading:false}}));
-        if (!s.loading) {{
-          clearInterval(_metaPollTimer); _metaPollTimer = null;
-          await loadImages();  // Galerie mit vollständigen Metadaten neu laden
-        }}
-      }}, 800);
-    }} else {{
+    // Metadaten-Status prüfen
+    const ms = await fetch('/api/meta-status').then(r=>r.json()).catch(()=>({{epoch:0}}));
+    const epochAtFetch = ms.epoch || 0;
+
+    if (metaCachedAtFetch > 0 && !ms.loading) {{
+      // Warm-Cache: Metadaten waren schon beim Abruf vorhanden – fertig
+      buildDateFilter();
       sbIdle(allImages.length + ' Bilder geladen');
+    }} else {{
+      // Cold-Start: Bilder kamen ohne Metadaten – pollen bis Epoch sich ändert
+      if (_metaPollTimer) clearInterval(_metaPollTimer);
+      if (ms.loading) {{
+        const msg = 'Metadaten werden geladen… ' + (ms.done||0) + ' / ' + (ms.total||allImages.length);
+        sbSet(msg, true);
+        document.getElementById('gallery-empty').textContent = msg;
+      }} else {{
+        sbSet('Metadaten werden geladen…', true);
+        document.getElementById('gallery-empty').textContent = 'Metadaten werden geladen…';
+      }}
+      _metaPollTimer = setInterval(async () => {{
+        const s = await fetch('/api/meta-status').then(r=>r.json()).catch(()=>({{epoch:epochAtFetch}}));
+        if (s.loading) {{
+          const msg = 'Metadaten werden geladen… ' + (s.done||0) + ' / ' + (s.total||allImages.length);
+          sbSet(msg, true);
+          document.getElementById('gallery-empty').textContent = msg;
+        }} else if ((s.epoch || 0) > epochAtFetch) {{
+          // Epoch gestiegen → neue Metadaten vorhanden → Galerie neu laden
+          clearInterval(_metaPollTimer); _metaPollTimer = null;
+          await loadImages();
+        }} else {{
+          // ExifTool nicht verfügbar oder fehlgeschlagen → trotzdem rendern
+          clearInterval(_metaPollTimer); _metaPollTimer = null;
+          renderGallery();
+          updateHeaderStats();
+          _rvUpdateButtons();
+          document.getElementById('gallery-empty').style.display = 'none';
+          buildDateFilter();
+          sbIdle(allImages.length + ' Bilder geladen (keine Metadaten)');
+        }}
+      }}, 600);
     }}
   }} catch(e) {{
     document.getElementById('gallery-empty').textContent = 'Fehler beim Laden: ' + e;
@@ -1236,49 +1419,54 @@ function renderGallery() {{
   updateSelCount();
 }}
 
+function metaRow(label, value, highlight) {{
+  if (!value) return null;
+  const row = document.createElement('div');
+  row.className = 'meta-row';
+  const l = document.createElement('div'); l.className = 'meta-label'; l.textContent = label;
+  const v = document.createElement('div'); v.className = 'meta-val' + (highlight ? ' highlight' : ''); v.textContent = value;
+  row.appendChild(l); row.appendChild(v);
+  return row;
+}}
+
 function createCard(img) {{
   const card = document.createElement('div');
   card.className = 'card';
   card.dataset.filename  = img.filename;
   card.dataset.status    = img.status;
   card.dataset.timestamp = img.timestamp || '';
+  card.dataset.date      = img.date || '';
+  card.dataset.rating    = img.rating || 0;
 
-  // Linke Seite
+  // ── Spalte 1: Bild ──────────────────────────────────────────────────────
   const left = document.createElement('div');
   left.className = 'card-left';
 
+  // Bild-Bereich (wächst)
+  const imgWrap = document.createElement('div');
+  imgWrap.className = 'card-img-wrap';
   const thumb = document.createElement('img');
   thumb.src = '/thumbnail/' + encodeURIComponent(img.filename);
   thumb.alt = img.filename;
   thumb.loading = 'lazy';
   thumb.addEventListener('click', e => {{ e.stopPropagation(); openGalleryView(img.filename); }});
-  left.appendChild(thumb);
+  imgWrap.appendChild(thumb);
+  left.appendChild(imgWrap);
+
+  // Footer: Dateiname + Badge + Checkbox
+  const leftFooter = document.createElement('div');
+  leftFooter.className = 'card-left-footer';
 
   const fn = document.createElement('div');
   fn.className = 'card-filename';
-  fn.textContent = img.filename;
-  left.appendChild(fn);
-
-  if (img.date) {{
-    const dt = document.createElement('div');
-    dt.className = 'card-date';
-    dt.textContent = img.date;
-    left.appendChild(dt);
-  }}
+  fn.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+  fn.textContent = img.filename.split('/').pop();
+  leftFooter.appendChild(fn);
 
   const badge = document.createElement('span');
   badge.className = 'badge badge-' + img.status;
   badge.textContent = statusLabel(img.status);
-  left.appendChild(badge);
-
-  if (img.gps) {{
-    const gps = document.createElement('a');
-    gps.className = 'gps-link';
-    gps.href = img.gps.maps_url;
-    gps.target = '_blank';
-    gps.textContent = img.gps.formatted;
-    left.appendChild(gps);
-  }}
+  leftFooter.appendChild(badge);
 
   const selLabel = document.createElement('label');
   selLabel.className = 'card-select';
@@ -1287,85 +1475,168 @@ function createCard(img) {{
   selBox.checked = selected.has(img.filename);
   selBox.addEventListener('change', () => toggleSelect(img.filename, selBox.checked));
   selLabel.appendChild(selBox);
-  selLabel.appendChild(document.createTextNode(' Für KI'));
-  left.appendChild(selLabel);
+  selLabel.appendChild(document.createTextNode(' Keyword-Vorschlag'));
+  leftFooter.appendChild(selLabel);
 
-  // Rechte Seite
+  left.appendChild(leftFooter);
+
+  // ── Spalte 2: Metadaten ─────────────────────────────────────────────────
+  const meta = document.createElement('div');
+  meta.className = 'card-meta';
+
+  const addMeta = (label, val, hi) => {{
+    const r = metaRow(label, val, hi); if (r) meta.appendChild(r);
+  }};
+  const addHr = () => {{ const hr = document.createElement('hr'); hr.className = 'meta-divider'; meta.appendChild(hr); }};
+
+  // ── Datei ──
+  addMeta('Datei', img.filename.split('/').pop(), true);
+  if (img.date) addMeta('Aufnahmedatum', img.date);
+  const dims = [img.width && img.height ? img.width + '×' + img.height : '', img.megapixels ? img.megapixels + ' MP' : ''].filter(Boolean).join('  ·  ');
+  if (dims) addMeta('Auflösung', dims);
+  if (img.filesize) addMeta('Dateigröße', img.filesize);
+  if (img.software) addMeta('Software', img.software);
+
+  // ── Bewertung ──
+  if (img.rating > 0) {{
+    const rr = document.createElement('div'); rr.className = 'meta-row';
+    const rl = document.createElement('div'); rl.className = 'meta-label'; rl.textContent = 'Bewertung';
+    const rv = document.createElement('div'); rv.className = 'meta-rating';
+    rv.textContent = '★'.repeat(img.rating) + '☆'.repeat(5 - img.rating);
+    rr.appendChild(rl); rr.appendChild(rv); meta.appendChild(rr);
+  }}
+
+  // ── Kamera & Objektiv ──
+  if (img.camera || img.lens || img.serial) {{
+    addHr();
+    if (img.camera)  addMeta('Kamera', img.camera, true);
+    if (img.lens)    addMeta('Objektiv', img.lens);
+    if (img.serial)  addMeta('Seriennummer', img.serial);
+  }}
+
+  // ── Belichtung ──
+  if (img.focal || img.aperture || img.shutter || img.iso) {{
+    addHr();
+    const focal = [img.focal, img.focal35 ? '(35mm: ' + img.focal35 + ')' : ''].filter(Boolean).join(' ');
+    if (focal) addMeta('Brennweite', focal);
+    const exp = [
+      img.aperture ? 'f/' + img.aperture : '',
+      img.shutter  ? img.shutter + 's'   : '',
+      img.iso      ? 'ISO ' + img.iso    : '',
+      img.ev && img.ev !== '0' ? 'EV ' + img.ev : ''
+    ].filter(Boolean).join('  ·  ');
+    if (exp) addMeta('Belichtung', exp);
+    if (img.program)  addMeta('Programm',  img.program);
+    if (img.metering) addMeta('Messung',   img.metering);
+    if (img.wb)       addMeta('Weißabgl.', img.wb);
+    if (img.flash)    addMeta('Blitz',     img.flash);
+  }}
+
+  // ── GPS ──
+  if (img.gps) {{
+    addHr();
+    const gpsRow = document.createElement('div'); gpsRow.className = 'meta-row';
+    const gl = document.createElement('div'); gl.className = 'meta-label'; gl.textContent = 'GPS';
+    const ga = document.createElement('a');
+    ga.className = 'gps-link'; ga.href = img.gps.maps_url;
+    ga.target = '_blank'; ga.textContent = img.gps.formatted;
+    gpsRow.appendChild(gl); gpsRow.appendChild(ga); meta.appendChild(gpsRow);
+  }}
+
+  // ── Ort (IPTC) ──
+  if (img.city || img.subloc || img.state || img.country) {{
+    addHr();
+    const loc = [img.subloc, img.city, img.state, img.country].filter(Boolean).join(', ');
+    addMeta('Ort', loc);
+  }}
+
+  // ── Beschreibung & Copyright ──
+  if (img.caption || img.copyright) {{
+    addHr();
+    if (img.caption)   addMeta('Beschreibung', img.caption);
+    if (img.copyright) addMeta('Copyright', img.copyright);
+  }}
+
+  // ── In Datei gespeichert ──
+  if (img.ex_title || (img.ex_kw && img.ex_kw.length > 0)) {{
+    addHr();
+    if (img.ex_title) addMeta('Titel in Datei', img.ex_title);
+    if (img.ex_kw && img.ex_kw.length > 0) {{
+      const kwRow = document.createElement('div'); kwRow.className = 'meta-row';
+      const kl = document.createElement('div'); kl.className = 'meta-label';
+      kl.textContent = 'Keywords in Datei (' + img.ex_kw.length + ')';
+      kwRow.appendChild(kl);
+      const kwWrap = document.createElement('div'); kwWrap.className = 'meta-exkw';
+      img.ex_kw.slice(0, 10).forEach(k => {{
+        const s = document.createElement('span'); s.textContent = k; kwWrap.appendChild(s);
+      }});
+      if (img.ex_kw.length > 10) {{
+        const more = document.createElement('span'); more.textContent = '+' + (img.ex_kw.length - 10);
+        more.style.color = '#555'; kwWrap.appendChild(more);
+      }}
+      kwRow.appendChild(kwWrap); meta.appendChild(kwRow);
+    }}
+  }}
+
+  // ── Spalte 3: Titel + Keywords ─────────────────────────────────────────
   const right = document.createElement('div');
   right.className = 'card-right';
 
   const titleLabel = document.createElement('div');
-  titleLabel.className = 'field-label';
-  titleLabel.textContent = 'Titel';
+  titleLabel.className = 'field-label'; titleLabel.textContent = 'Titel';
   right.appendChild(titleLabel);
 
   const titleInput = document.createElement('input');
-  titleInput.className = 'title-input';
-  titleInput.type = 'text';
-  titleInput.maxLength = 200;
-  titleInput.value = img.title || '';
+  titleInput.className = 'title-input'; titleInput.type = 'text';
+  titleInput.maxLength = 200; titleInput.value = img.title || '';
   const titleCounter = document.createElement('div');
   titleCounter.className = 'title-counter';
-  titleInput.addEventListener('input', () => updateTitleCounter(titleInput, titleCounter));
+  titleInput.addEventListener('input', () => {{ updateTitleCounter(titleInput, titleCounter); scheduleAutoSave(card, badge); }});
+  // Tab vom Titel-Feld springt direkt zum Keyword-Eingabefeld
+  titleInput.addEventListener('keydown', e => {{
+    if (e.key === 'Tab' && !e.shiftKey) {{ e.preventDefault(); kwInput.focus(); }}
+  }});
   updateTitleCounter(titleInput, titleCounter);
   right.appendChild(titleInput);
   right.appendChild(titleCounter);
 
-  // Keywords Header
-  const kwHead = document.createElement('div');
-  kwHead.className = 'kw-header';
-  const kwLabel = document.createElement('div');
-  kwLabel.className = 'field-label';
-  kwLabel.textContent = 'Keywords';
-  const kwCounter = document.createElement('span');
-  kwCounter.className = 'kw-counter';
-  kwHead.appendChild(kwLabel);
-  kwHead.appendChild(kwCounter);
+  const kwHead = document.createElement('div'); kwHead.className = 'kw-header';
+  const kwLabel = document.createElement('div'); kwLabel.className = 'field-label'; kwLabel.textContent = 'Keywords';
+  const kwCounter = document.createElement('span'); kwCounter.className = 'kw-counter';
+  kwHead.appendChild(kwLabel); kwHead.appendChild(kwCounter);
   right.appendChild(kwHead);
 
-  // Tags
-  const tags = document.createElement('div');
-  tags.className = 'tags';
+  const tags = document.createElement('div'); tags.className = 'tags';
   (img.keywords || []).forEach(kw => appendTag(tags, kw));
   right.appendChild(tags);
   updateCounter(kwCounter, tags);
 
-  // Keyword-Eingabe
-  const addRow = document.createElement('div');
-  addRow.className = 'add-row';
+  const addRow = document.createElement('div'); addRow.className = 'add-row';
   const kwInput = document.createElement('input');
-  kwInput.className = 'kw-input';
-  kwInput.type = 'text';
+  kwInput.className = 'kw-input'; kwInput.type = 'text';
   kwInput.placeholder = 'Keywords hinzufügen, Komma-getrennt…';
   kwInput.addEventListener('keydown', e => handleKwKey(e, tags, kwCounter));
+  // Shift+Tab vom Keyword-Feld zurück zum Titel
+  kwInput.addEventListener('keydown', e => {{
+    if (e.key === 'Tab' && e.shiftKey) {{ e.preventDefault(); titleInput.focus(); }}
+  }});
   const addBtn = document.createElement('button');
-  addBtn.className = 'btn-add';
-  addBtn.textContent = '+';
+  addBtn.className = 'btn-add'; addBtn.textContent = '+';
+  addBtn.tabIndex = -1;  // aus Tab-Reihenfolge raus
   addBtn.addEventListener('click', () => addFromInput(kwInput, tags, kwCounter));
-  addRow.appendChild(kwInput);
-  addRow.appendChild(addBtn);
+  addRow.appendChild(kwInput); addRow.appendChild(addBtn);
   right.appendChild(addRow);
 
-  // Fehler (falls vorhanden)
   if (img.error_msg) {{
     const err = document.createElement('div');
-    err.className = 'error-msg';
-    err.textContent = img.error_msg;
+    err.className = 'error-msg'; err.textContent = img.error_msg;
     right.appendChild(err);
   }}
 
-  // Footer
-  const footer = document.createElement('div');
-  footer.className = 'card-footer';
-  const saveBtn = document.createElement('button');
-  saveBtn.className = 'btn-save';
-  saveBtn.textContent = 'Speichern';
-  saveBtn.addEventListener('click', () => saveCard(card, badge));
-  footer.appendChild(saveBtn);
-  right.appendChild(footer);
 
   card.appendChild(left);
   card.appendChild(right);
+  card.appendChild(meta);
   return card;
 }}
 
@@ -1398,7 +1669,7 @@ function updateCard(card, img) {{
 // ── Tag-Verwaltung ────────────────────────────────────────────────────────
 
 function appendTag(container, kw) {{
-  kw = kw.trim();
+  kw = String(kw).trim();
   if (!kw) return;
   const tag = document.createElement('span');
   tag.className = 'tag';
@@ -1409,7 +1680,10 @@ function appendTag(container, kw) {{
   btn.addEventListener('click', () => {{
     tag.remove();
     const c = container.closest('.card');
-    if (c) updateCounter(c.querySelector('.kw-counter'), container);
+    if (c) {{
+      updateCounter(c.querySelector('.kw-counter'), container);
+      scheduleAutoSave(c, c.querySelector('.badge'));
+    }}
   }});
   tag.appendChild(txt);
   tag.appendChild(btn);
@@ -1446,9 +1720,18 @@ function addFromInput(input, container, counter) {{
   }});
   input.value = '';
   updateCounter(counter, container);
+  const c = container.closest('.card');
+  if (c) scheduleAutoSave(c, c.querySelector('.badge'));
 }}
 
 // ── Speichern ─────────────────────────────────────────────────────────────
+
+const _saveTimers = {{}};
+function scheduleAutoSave(card, badge) {{
+  const key = card.dataset.filename;
+  clearTimeout(_saveTimers[key]);
+  _saveTimers[key] = setTimeout(() => saveCard(card, badge), 1000);
+}}
 
 async function saveCard(card, badge) {{
   const filename = card.dataset.filename;
@@ -1461,9 +1744,13 @@ async function saveCard(card, badge) {{
     }});
     const d = await r.json();
     if (d.ok) {{
-      card.dataset.status = 'done';
-      if (badge) {{ badge.className = 'badge badge-done'; badge.textContent = 'Übernommen'; }}
-      toast('\u2713 Gespeichert: ' + filename);
+      const isEmpty = !title && keywords.length === 0;
+      const newStatus = isEmpty ? 'unbearbeitet' : 'done';
+      card.dataset.status = newStatus;
+      if (badge) {{
+        if (isEmpty) {{ badge.className = 'badge badge-new'; badge.textContent = 'Unbearbeitet'; }}
+        else {{ badge.className = 'badge badge-done'; badge.textContent = 'Übernommen'; }}
+      }}
       updateHeaderStats();
     }} else {{
       toast('Fehler: ' + (d.error || 'Unbekannt'));
@@ -1595,16 +1882,143 @@ function setFilter(status, btn) {{
     cards.sort((a, b) => (b.dataset.timestamp || '').localeCompare(a.dataset.timestamp || ''));
     cards.forEach(c => grid.appendChild(c));
   }}
-  document.querySelectorAll('.card').forEach(c => applyCardVisibility(c, status));
+  applyAllFilters();
 }}
 
 function applyFilter(status) {{
   document.querySelectorAll('.card').forEach(c => applyCardVisibility(c, status));
 }}
 
+let _minRating = 0;
+
 function applyCardVisibility(card, status) {{
-  const show = status === 'all' || card.dataset.status === status;
-  card.classList.toggle('hidden', !show);
+  const s = card.dataset.status;
+  const statusOk = status === 'all'
+    || status === s
+    || (status === 'mit'   && s === 'done')
+    || (status === 'ohne'  && s !== 'done');
+  const dateOk   = matchesDateFilter(card.dataset.date || '');
+  const ratingOk = _minRating === 0 || parseInt(card.dataset.rating || 0) >= _minRating;
+  card.classList.toggle('hidden', !(statusOk && dateOk && ratingOk));
+}}
+
+// ── Datumsfilter ─────────────────────────────────────────────────────────────
+const _MONTHS = ['','Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez'];
+
+function _fillSelect(sel, placeholder, values, labels, prevVal) {{
+  while (sel.options.length) sel.remove(0);
+  const o0 = document.createElement('option');
+  o0.value = ''; o0.textContent = placeholder; sel.appendChild(o0);
+  values.forEach((v, i) => {{
+    const o = document.createElement('option');
+    o.value = v; o.textContent = labels ? labels[i] : v;
+    if (v === prevVal) o.selected = true;
+    sel.appendChild(o);
+  }});
+}}
+
+function buildDateFilter() {{
+  const dates = new Set(allImages.map(i => i.date).filter(Boolean));
+  const years = [...new Set([...dates].map(d => d.slice(0,4)))].sort();
+  const sel = document.getElementById('df-year');
+  const prev = sel.value;
+  _fillSelect(sel, 'Alle Jahre', years, null, prev);
+  dfYearChange(true);
+}}
+
+function _datesFor(year, month) {{
+  return allImages.map(i => i.date).filter(d => {{
+    if (!d) return false;
+    if (year && !d.startsWith(year)) return false;
+    if (month && d.slice(5,7) !== month.padStart(2,'0')) return false;
+    return true;
+  }});
+}}
+
+function dfYearChange(keepMonth) {{
+  const year = document.getElementById('df-year').value;
+  const msel = document.getElementById('df-month');
+  const prev = keepMonth ? msel.value : '';
+  const months = [...new Set(_datesFor(year,'').map(d => d.slice(5,7)))].sort();
+  const labels = months.map(m => _MONTHS[parseInt(m)] || m);
+  _fillSelect(msel, 'Alle Monate', months, labels, prev);
+  dfMonthChange(keepMonth);
+}}
+
+function dfMonthChange(keepDay) {{
+  const year  = document.getElementById('df-year').value;
+  const month = document.getElementById('df-month').value;
+  const dsel  = document.getElementById('df-day');
+  const prev  = keepDay ? dsel.value : '';
+  const days  = [...new Set(_datesFor(year, month).map(d => d.slice(8,10)))].sort((a,b)=>+a-+b);
+  const labels = days.map(d => String(parseInt(d)));
+  _fillSelect(dsel, 'Alle Tage', days, labels, prev);
+  applyAllFilters();
+}}
+
+let _metaColVisible = true;
+function toggleMetaCols() {{
+  _metaColVisible = !_metaColVisible;
+  document.querySelectorAll('.card-meta').forEach(m => m.classList.toggle('hidden', !_metaColVisible));
+  document.querySelectorAll('.card').forEach(c => c.classList.toggle('meta-hidden', !_metaColVisible));
+  document.getElementById('btn-meta-toggle').classList.toggle('active', _metaColVisible);
+}}
+
+function toggleRatingFilter() {{
+  const bar = document.getElementById('rating-bar');
+  const btn = document.getElementById('btn-rating-toggle');
+  const isOpen = bar.classList.toggle('open');
+  btn.classList.toggle('active', isOpen || _minRating > 0);
+}}
+
+function setRatingFilter(n, btn) {{
+  _minRating = n;
+  document.querySelectorAll('.rating-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('btn-rating-toggle').classList.toggle('active', n > 0);
+  applyAllFilters();
+}}
+
+function toggleDateFilter() {{
+  const bar = document.getElementById('date-filter-bar');
+  const btn = document.getElementById('btn-date-toggle');
+  const isOpen = bar.classList.toggle('open');
+  btn.classList.toggle('active', isOpen || !!document.getElementById('df-date').value);
+  if (isOpen) document.getElementById('df-date').focus();
+}}
+
+function matchesDateFilter(date) {{
+  const year  = document.getElementById('df-year')?.value  || '';
+  const month = document.getElementById('df-month')?.value || '';
+  const day   = document.getElementById('df-day')?.value   || '';
+  if (!year && !month && !day) return true;
+  if (!date) return false;
+  if (year  && !date.startsWith(year)) return false;
+  if (month && date.slice(5,7) !== month.padStart(2,'0')) return false;
+  if (day   && date.slice(8,10) !== day.padStart(2,'0')) return false;
+  return true;
+}}
+
+function applyAllFilters() {{
+  document.querySelectorAll('.card').forEach(c => applyCardVisibility(c, currentFilter));
+  const active = !!(document.getElementById('df-year')?.value ||
+                    document.getElementById('df-month')?.value ||
+                    document.getElementById('df-day')?.value);
+  document.getElementById('df-clear-btn').style.display = active ? 'inline-block' : 'none';
+  document.getElementById('btn-date-toggle')?.classList.toggle('active', active);
+  ['df-year','df-month','df-day'].forEach(id =>
+    document.getElementById(id)?.classList.toggle('df-active', !!document.getElementById(id)?.value));
+  const visible = document.querySelectorAll('.card:not(.hidden)').length;
+  const total   = document.querySelectorAll('.card').length;
+  document.getElementById('df-count').textContent = active ? visible + ' / ' + total + ' Bilder' : '';
+}}
+
+function clearDateFilter() {{
+  ['df-year','df-month','df-day'].forEach(id => {{
+    const el = document.getElementById(id);
+    if (el) {{ el.value = ''; el.classList.remove('df-active'); }}
+  }});
+  dfYearChange(false);
 }}
 
 // ── Ordner wählen ────────────────────────────────────────────────────────
@@ -1921,6 +2335,14 @@ async function openReview() {{
   document.addEventListener('keydown', _rvKey);
 }}
 
+function rvToggleMeta() {{
+  const fields = document.getElementById('rv-fields');
+  const btn = document.getElementById('rv-toggle-meta');
+  const visible = !fields.classList.contains('hidden');
+  fields.classList.toggle('hidden', visible);
+  btn.style.color = visible ? '' : 'var(--accent)';
+}}
+
 function closeReview() {{
   document.getElementById('review-modal').classList.add('hidden');
   document.removeEventListener('keydown', _rvKey);
@@ -1990,7 +2412,7 @@ function _rvShow(idx) {{
 let _dragTag = null;
 
 function _rvTag(container, kw) {{
-  kw = kw.trim(); if (!kw) return;
+  kw = String(kw).trim(); if (!kw) return;
   const tag = document.createElement('span');
   tag.className = 'tag';
   tag.draggable = true;
@@ -2194,6 +2616,7 @@ function openGalleryView(filename) {{
     <div class="rv-header">
       <span id="rv-count" class="rv-hcount"></span>
       <span id="rv-name"  class="rv-hname"></span>
+      <button id="rv-toggle-meta" class="rv-hclose" onclick="rvToggleMeta()" title="Metadaten ein-/ausblenden" style="font-size:14px">&#x2139;</button>
       <button class="rv-hclose" onclick="closeReview()" title="Schließen (Esc)">&#x2715;</button>
     </div>
     <div class="rv-body">
@@ -2201,7 +2624,7 @@ function openGalleryView(filename) {{
         <span class="img-status" id="rv-img-status">⏳ Lade Bild…</span>
         <img id="rv-img" src="" alt="" style="display:none">
       </div>
-      <div class="rv-fields">
+      <div class="rv-fields hidden" id="rv-fields">
         <div id="rv-gps" class="rv-gps" style="display:none"></div>
         <div class="field-label">Titel</div>
         <input id="rv-title" class="title-input" type="text" maxlength="200" style="width:100%"
@@ -2221,9 +2644,9 @@ function openGalleryView(filename) {{
     </div>
     <div class="rv-footer">
       <button id="rv-prev" class="btn-rnav" onclick="rvNav(-1)">&#x25C4; Zur&#xFC;ck</button>
-      <button id="rv-next" class="btn-rskip" onclick="rvNav(1)">&#xDC;berspringen &#x25BA;</button>
+      <button id="rv-next" class="btn-rskip" onclick="rvNav(1)">Weiter &#x25BA;</button>
       <span style="flex:1;font-size:11px;color:var(--muted);text-align:center">
-        &#x2190;&#x2192; Navigation &nbsp;&middot;&nbsp; Enter = Speichern &nbsp;&middot;&nbsp; Esc = Schlie&#xDF;en
+        &#x2190;&#x2192; Navigation &nbsp;&middot;&nbsp; Enter = Speichern &nbsp;&middot;&nbsp; Tab = Weiter &nbsp;&middot;&nbsp; Esc = Schlie&#xDF;en
       </span>
       <button class="btn-rnav" onclick="openTransfer()" title="Titel &amp; Keywords auf andere Bilder übertragen">&#x2197; Übertragen</button>
       <button class="btn-rsave" onclick="rvSave()">&#x2713; Speichern &amp; weiter</button>
