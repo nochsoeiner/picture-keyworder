@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# App data (progress files mit API-Keys / persönlichen Daten)
+.claude/
+
+# Bilder (nicht ins Repo)
+*.jpg
+*.jpeg
+*.JPG
+*.JPEG
+*.png
+*.tiff
+*.tif
