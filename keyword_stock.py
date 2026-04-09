@@ -170,10 +170,10 @@ def _esc(s) -> str:
             .replace(">","&gt;").replace('"',"&quot;").replace("'","&#39;"))
 
 def _jpegs() -> list:
-    """Alle JPEGs im Ordner und Unterordnern (gecacht pro Ordner)."""
+    """Alle JPEGs direkt im gewählten Ordner (keine Unterordner, gecacht pro Ordner)."""
     global _jpegs_cache
     if not _jpegs_cache:
-        _jpegs_cache = sorted(p for p in _dir.rglob("*")
+        _jpegs_cache = sorted(p for p in _dir.glob("*")
                               if p.suffix.lower() in (".jpg", ".jpeg") and p.is_file()
                               and not p.name.startswith("."))
     return _jpegs_cache
@@ -1001,6 +1001,14 @@ main{{flex:1;overflow:hidden;display:flex;flex-direction:column}}
 .rating-btn:hover{{border-color:#666;color:#ffd700}}
 .rating-btn.active{{border-color:#ffd700;color:#ffd700;background:#1a1500}}
 .meta-rating{{color:#ffd700;font-size:13px;letter-spacing:1px}}
+.folder-filter-bar{{display:none;align-items:center;gap:6px;padding:5px 14px;
+                    background:#1a1a1a;border-bottom:1px solid var(--border);flex-wrap:wrap}}
+.folder-filter-bar.open{{display:flex}}
+.folder-btn{{background:none;border:1px solid #333;color:#aaa;padding:3px 10px;
+             border-radius:5px;font-size:12px;cursor:pointer;white-space:nowrap}}
+.folder-btn:hover{{border-color:#666;color:#fff}}
+.folder-btn.active{{border-color:#4fc3f7;color:#4fc3f7;background:rgba(79,195,247,.08)}}
+.folder-btn .folder-count{{font-size:10px;color:var(--muted);margin-left:4px}}
 /* ── KI-Analyse ── */
 .analyse-layout{{display:grid;grid-template-columns:320px 1fr;gap:16px;flex:1}}
 .analyse-config{{background:var(--surface2);border:1px solid var(--border);
@@ -1190,6 +1198,7 @@ select:focus, .key-input:focus{{outline:none;border-color:#555}}
       <button class="btn-filter-toggle" id="btn-meta-toggle" onclick="toggleMetaCols()" title="Metadaten-Spalte ein-/ausblenden">&#x1F4CB; Metadaten</button>
       <button class="btn-filter-toggle" id="btn-rating-toggle" onclick="toggleRatingFilter()" title="Nach Lightroom-Bewertung filtern">&#x2B50; Rating</button>
       <button class="btn-filter-toggle" id="btn-date-toggle" onclick="toggleDateFilter()" title="Datumsfilter ein-/ausblenden">&#x1F4C5; Datum</button>
+      <button class="btn-filter-toggle" id="btn-folder-toggle" onclick="toggleFolderFilter()" title="Nach Unterordner filtern" style="display:none">&#x1F4C1; Ordner</button>
       <span class="select-count" id="sel-count">0 ausgew&#xE4;hlt</span>
       <button class="btn-review" id="btn-review-gallery" onclick="openReview()" title="KI-Vorschl&#xE4;ge Bild f&#xFC;r Bild pr&#xFC;fen und speichern">&#x2713; Vorschl&#xE4;ge pr&#xFC;fen</button>
       <button class="btn-primary" onclick="goAnalysis()" title="Ausgew&#xE4;hlte Bilder mit KI analysieren und Keywords generieren">&#x2728; Keywords generieren &#x203A;</button>
@@ -1210,6 +1219,12 @@ select:focus, .key-input:focus{{outline:none;border-color:#555}}
       <select class="df-select" id="df-day" onchange="applyAllFilters()"><option value="">Alle Tage</option></select>
       <button class="df-clear" id="df-clear-btn" onclick="clearDateFilter()" style="display:none">&#x2715; Zur&#xFC;cksetzen</button>
       <span class="df-count" id="df-count"></span>
+    </div>
+    <div class="folder-filter-bar" id="folder-filter-bar">
+      <span class="toolbar-label">Ordner</span>
+      <div id="folder-btns" style="display:contents"></div>
+      <button class="df-clear" id="folder-clear-btn" onclick="clearFolderFilter()" style="display:none">&#x2715; Zur&#xFC;cksetzen</button>
+      <span class="df-count" id="folder-count"></span>
     </div>
     </div><!-- /sticky-header -->
     <div class="gallery-grid" id="gallery-grid">
@@ -1307,6 +1322,8 @@ let allImages = [];
 let selected = new Set();
 let currentFilter = 'all';
 let pollTimer = null;
+let _excludedFolders = new Set();
+let _allFolders = [];
 
 // ── Init ──────────────────────────────────────────────────────────────────
 
@@ -1358,7 +1375,7 @@ async function loadImages() {{
 
     if (metaCachedAtFetch > 0 && !ms.loading) {{
       // Warm-Cache: Metadaten waren schon beim Abruf vorhanden – fertig
-      buildDateFilter();
+      buildDateFilter(); buildFolderFilter();
       sbIdle(allImages.length + ' Bilder geladen');
     }} else {{
       // Cold-Start: Bilder kamen ohne Metadaten – pollen bis Epoch sich ändert
@@ -1388,7 +1405,7 @@ async function loadImages() {{
           updateHeaderStats();
           _rvUpdateButtons();
           document.getElementById('gallery-empty').style.display = 'none';
-          buildDateFilter();
+          buildDateFilter(); buildFolderFilter();
           sbIdle(allImages.length + ' Bilder geladen (keine Metadaten)');
         }}
       }}, 600);
@@ -1437,6 +1454,7 @@ function createCard(img) {{
   card.dataset.timestamp = img.timestamp || '';
   card.dataset.date      = img.date || '';
   card.dataset.rating    = img.rating || 0;
+  card.dataset.folder    = img.filename.includes('/') ? img.filename.substring(0, img.filename.lastIndexOf('/')) : '';
 
   // ── Spalte 1: Bild ──────────────────────────────────────────────────────
   const left = document.createElement('div');
@@ -1899,7 +1917,8 @@ function applyCardVisibility(card, status) {{
     || (status === 'ohne'  && s !== 'done');
   const dateOk   = matchesDateFilter(card.dataset.date || '');
   const ratingOk = _minRating === 0 || parseInt(card.dataset.rating || 0) >= _minRating;
-  card.classList.toggle('hidden', !(statusOk && dateOk && ratingOk));
+  const folderOk = matchesFolderFilter(card.dataset.folder || '');
+  card.classList.toggle('hidden', !(statusOk && dateOk && ratingOk && folderOk));
 }}
 
 // ── Datumsfilter ─────────────────────────────────────────────────────────────
@@ -1999,6 +2018,83 @@ function matchesDateFilter(date) {{
   return true;
 }}
 
+// ── Ordnerfilter ─────────────────────────────────────────────────────────────
+
+function buildFolderFilter() {{
+  const folders = new Set(allImages.map(i =>
+    i.filename.includes('/') ? i.filename.substring(0, i.filename.lastIndexOf('/')) : ''
+  ));
+  _allFolders = [...folders].sort();
+  _excludedFolders.clear();
+
+  const container = document.getElementById('folder-btns');
+  container.textContent = '';
+  const toggleBtn = document.getElementById('btn-folder-toggle');
+
+  if (_allFolders.length <= 1) {{
+    toggleBtn.style.display = 'none';
+    document.getElementById('folder-filter-bar').classList.remove('open');
+    return;
+  }}
+  toggleBtn.style.display = '';
+
+  _allFolders.forEach(f => {{
+    const count = allImages.filter(i => {{
+      const imgFolder = i.filename.includes('/')
+        ? i.filename.substring(0, i.filename.lastIndexOf('/')) : '';
+      return imgFolder === f;
+    }}).length;
+    const btn = document.createElement('button');
+    btn.className = 'folder-btn active';
+    btn.dataset.folder = f;
+    const nameSpan = document.createTextNode(f || '(Stammordner)');
+    const countSpan = document.createElement('span');
+    countSpan.className = 'folder-count';
+    countSpan.textContent = '(' + count + ')';
+    btn.appendChild(nameSpan);
+    btn.appendChild(document.createTextNode(' '));
+    btn.appendChild(countSpan);
+    btn.onclick = () => toggleFolder(f, btn);
+    container.appendChild(btn);
+  }});
+}}
+
+function toggleFolder(folder, btn) {{
+  if (_excludedFolders.has(folder)) {{
+    _excludedFolders.delete(folder);
+    btn.classList.add('active');
+  }} else {{
+    _excludedFolders.add(folder);
+    btn.classList.remove('active');
+  }}
+  document.getElementById('btn-folder-toggle').classList.toggle('active',
+    _excludedFolders.size > 0 || document.getElementById('folder-filter-bar').classList.contains('open'));
+  document.getElementById('folder-clear-btn').style.display =
+    _excludedFolders.size > 0 ? 'inline-block' : 'none';
+  applyAllFilters();
+}}
+
+function toggleFolderFilter() {{
+  const bar = document.getElementById('folder-filter-bar');
+  const btn = document.getElementById('btn-folder-toggle');
+  const isOpen = bar.classList.toggle('open');
+  btn.classList.toggle('active', isOpen || _excludedFolders.size > 0);
+}}
+
+function clearFolderFilter() {{
+  _excludedFolders.clear();
+  document.querySelectorAll('.folder-btn').forEach(b => b.classList.add('active'));
+  document.getElementById('folder-clear-btn').style.display = 'none';
+  document.getElementById('btn-folder-toggle').classList.toggle('active',
+    document.getElementById('folder-filter-bar').classList.contains('open'));
+  applyAllFilters();
+}}
+
+function matchesFolderFilter(folder) {{
+  if (_excludedFolders.size === 0) return true;
+  return !_excludedFolders.has(folder);
+}}
+
 function applyAllFilters() {{
   document.querySelectorAll('.card').forEach(c => applyCardVisibility(c, currentFilter));
   const active = !!(document.getElementById('df-year')?.value ||
@@ -2008,9 +2104,13 @@ function applyAllFilters() {{
   document.getElementById('btn-date-toggle')?.classList.toggle('active', active);
   ['df-year','df-month','df-day'].forEach(id =>
     document.getElementById(id)?.classList.toggle('df-active', !!document.getElementById(id)?.value));
+  const folderActive = _excludedFolders.size > 0;
+  const anyFilter = active || folderActive;
   const visible = document.querySelectorAll('.card:not(.hidden)').length;
   const total   = document.querySelectorAll('.card').length;
-  document.getElementById('df-count').textContent = active ? visible + ' / ' + total + ' Bilder' : '';
+  const countText = anyFilter ? visible + ' / ' + total + ' Bilder' : '';
+  document.getElementById('df-count').textContent = active ? countText : '';
+  document.getElementById('folder-count').textContent = folderActive ? countText : '';
 }}
 
 function clearDateFilter() {{
@@ -2032,6 +2132,9 @@ async function pickFolder() {{
       document.getElementById('folder-path').textContent = d.path;
       document.getElementById('folder-path').title = d.path;
       allImages = []; selected.clear();
+      _excludedFolders.clear();
+      document.getElementById('folder-filter-bar').classList.remove('open');
+      document.getElementById('btn-folder-toggle').classList.remove('active');
       setFilter('all', document.querySelector('.filter-btn'));
       document.getElementById('gallery-grid').innerHTML =
         '<div class="empty-state" id="gallery-empty">Bilder werden geladen…</div>';
